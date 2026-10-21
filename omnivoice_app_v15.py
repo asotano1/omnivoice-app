@@ -1,5 +1,9 @@
 # ===========================================================================
 #  OmniVoice DEFINITIVO - app (motor oficial k2-fsa/OmniVoice)
+#  v6.1: + endereco fixo do ngrok volta a funcionar: tenta 3 formas de pedir
+#        o dominio reservado (domain / url / hostname), porque a API do
+#        agente mudou e a forma antiga passou a devolver error_code 103.
+#        Se nenhuma funcionar, imprime o erro de cada uma. Resto intocado.
 #  v6.0: + le as vozes de uma pasta local (clonada do GitHub) em vez do
 #        Google Drive. Acaba com a tela de autorizacao do Drive a cada
 #        sessao nova do Colab. Nada mais foi alterado em relacao ao v5.9.
@@ -20,7 +24,7 @@ import torch
 import gradio as gr
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 
-VERSAO       = "6.0"
+VERSAO       = "6.1"
 MODEL_ID     = "k2-fsa/OmniVoice"
 TEM_GPU      = torch.cuda.is_available()
 DEVICE       = "cuda:0" if TEM_GPU else "cpu"
@@ -675,7 +679,10 @@ with gr.Blocks(title=f"OmniVoice v{VERSAO}", theme=gr.themes.Soft(
 NGROK_DOMINIO = "unmutteringly-wrongful-briella.ngrok-free.dev"
 
 def _abrir_ngrok(demo):
-    """Abre um tunel ngrok no dominio fixo. Devolve a URL, ou None se falhar."""
+    """Abre um tunel ngrok no dominio fixo. Devolve a URL, ou None se falhar.
+    v6.1: tenta 3 formas de pedir o dominio reservado. A forma antiga (domain=)
+    passou a devolver 'error_code 103 / invalid endpoint configuration' depois
+    que a API do agente do ngrok mudou."""
     try:
         import subprocess, sys as _sys
         try:
@@ -683,8 +690,17 @@ def _abrir_ngrok(demo):
         except ImportError:
             subprocess.run([_sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=True)
             from pyngrok import ngrok as _ng
+        try:
+            import pyngrok as _pn
+            print("ngrok: pyngrok versao " + str(getattr(_pn, "__version__", "?")))
+        except Exception:
+            pass
         from google.colab import userdata as _ud
-        _tok = _ud.get("NGROK_TOKEN")
+        try:
+            _tok = _ud.get("NGROK_TOKEN")
+        except Exception as _te:
+            print("AVISO: nao consegui ler NGROK_TOKEN nos Secrets do Colab (" + str(_te) + ") - seguindo sem endereco fixo.")
+            return None
         if not _tok:
             print("AVISO: NGROK_TOKEN vazio nos Secrets do Colab - seguindo sem endereco fixo.")
             return None
@@ -694,9 +710,27 @@ def _abrir_ngrok(demo):
         except Exception:
             pass
         _porta = getattr(demo, "server_port", None) or 7860
-        _url = _ng.connect(_porta, domain=NGROK_DOMINIO).public_url
-        print("OK: endereco fixo (ngrok) -> " + str(_url))
-        return _url
+        _formas = [
+            ("domain",   lambda: _ng.connect(_porta, domain=NGROK_DOMINIO)),
+            ("url",      lambda: _ng.connect(_porta, url="https://" + NGROK_DOMINIO)),
+            ("hostname", lambda: _ng.connect(_porta, hostname=NGROK_DOMINIO)),
+        ]
+        _erros = []
+        for _nome, _fn in _formas:
+            try:
+                _url = _fn().public_url
+                print("OK: endereco fixo (ngrok, forma '" + _nome + "') -> " + str(_url))
+                return _url
+            except Exception as _e1:
+                _erros.append(_nome + " -> " + str(_e1)[:300])
+                try:
+                    _ng.kill()
+                except Exception:
+                    pass
+        print("AVISO: ngrok nao subiu em nenhuma das 3 formas - seguindo com o link normal do Gradio.")
+        for _m in _erros:
+            print("   - " + _m)
+        return None
     except Exception as _e:
         print("AVISO: ngrok nao subiu (" + str(_e) + ") - seguindo com o link normal do Gradio.")
         return None
