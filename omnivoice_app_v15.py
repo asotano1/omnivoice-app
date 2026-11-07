@@ -1,5 +1,10 @@
 # ===========================================================================
 #  OmniVoice DEFINITIVO - app (motor oficial k2-fsa/OmniVoice)
+#  v6.2: + endereco fixo passa a ser dominio proprio via tunel da Cloudflare
+#        (voz.ia51maisvoz.com.br). Sai o ngrok, que vivia caindo com o
+#        error_code 103. Gradio agora sobe na porta fixa 7860, que e pra
+#        onde o tunel aponta. Token do tunel vem dos Secrets do Colab
+#        (CF_TUNNEL_TOKEN). Se o tunel falhar, segue no link do Gradio.
 #  v6.1: + endereco fixo do ngrok volta a funcionar: tenta 3 formas de pedir
 #        o dominio reservado (domain / url / hostname), porque a API do
 #        agente mudou e a forma antiga passou a devolver error_code 103.
@@ -675,71 +680,87 @@ with gr.Blocks(title=f"OmniVoice v{VERSAO}", theme=gr.themes.Soft(
     btn_desligar.click(fn=desligar_vm, inputs=desliga_state,
                        outputs=[desliga_state, status_desligar])
 
-# ---- v5.9: endereco fixo via ngrok (opcional, nunca derruba o app) ----
-NGROK_DOMINIO = "unmutteringly-wrongful-briella.ngrok-free.dev"
+# ---- v6.2: endereco fixo via Cloudflare Tunnel (substitui o ngrok) ----
+# O ngrok vivia caindo (error_code 103 / invalid endpoint configuration).
+# Agora o endereco fixo e um dominio proprio, roteado por um tunel da Cloudflare.
+# O token do tunel fica nos Secrets do Colab (CF_TUNNEL_TOKEN) e NUNCA no codigo,
+# porque este repositorio e publico.
+CF_DOMINIO = "voz.ia51maisvoz.com.br"
+PORTA_FIXA = 7860
 
-def _abrir_ngrok(demo):
-    """Abre um tunel ngrok no dominio fixo. Devolve a URL, ou None se falhar.
-    v6.1: tenta 3 formas de pedir o dominio reservado. A forma antiga (domain=)
-    passou a devolver 'error_code 103 / invalid endpoint configuration' depois
-    que a API do agente do ngrok mudou."""
+def _abrir_cloudflare():
+    """Sobe o tunel da Cloudflare apontando pro Gradio na porta fixa.
+    Devolve a URL do endereco fixo, ou None se algo falhar.
+    Nunca levanta excecao: se nao der, o app segue no link normal do Gradio."""
     try:
-        import subprocess, sys as _sys
+        import subprocess, os as _os, time as _t, shutil as _sh
         try:
-            from pyngrok import ngrok as _ng
-        except ImportError:
-            subprocess.run([_sys.executable, "-m", "pip", "install", "-q", "pyngrok"], check=True)
-            from pyngrok import ngrok as _ng
-        try:
-            import pyngrok as _pn
-            print("ngrok: pyngrok versao " + str(getattr(_pn, "__version__", "?")))
-        except Exception:
-            pass
-        from google.colab import userdata as _ud
-        try:
-            _tok = _ud.get("NGROK_TOKEN")
+            from google.colab import userdata as _ud
+            _tok = _ud.get("CF_TUNNEL_TOKEN")
         except Exception as _te:
-            print("AVISO: nao consegui ler NGROK_TOKEN nos Secrets do Colab (" + str(_te) + ") - seguindo sem endereco fixo.")
+            print("AVISO: nao consegui ler CF_TUNNEL_TOKEN nos Secrets do Colab ("
+                  + str(_te) + ") - seguindo sem endereco fixo.")
             return None
         if not _tok:
-            print("AVISO: NGROK_TOKEN vazio nos Secrets do Colab - seguindo sem endereco fixo.")
+            print("AVISO: CF_TUNNEL_TOKEN vazio nos Secrets do Colab - seguindo sem endereco fixo.")
             return None
-        _ng.set_auth_token(_tok)
-        try:
-            _ng.kill()
-        except Exception:
-            pass
-        _porta = getattr(demo, "server_port", None) or 7860
-        _formas = [
-            ("domain",   lambda: _ng.connect(_porta, domain=NGROK_DOMINIO)),
-            ("url",      lambda: _ng.connect(_porta, url="https://" + NGROK_DOMINIO)),
-            ("hostname", lambda: _ng.connect(_porta, hostname=NGROK_DOMINIO)),
-        ]
-        _erros = []
-        for _nome, _fn in _formas:
+
+        _bin = _sh.which("cloudflared") or "/usr/local/bin/cloudflared"
+        if not _os.path.exists(_bin):
+            print("cloudflared: baixando...")
+            _url = ("https://github.com/cloudflare/cloudflared/releases/latest/"
+                    "download/cloudflared-linux-amd64")
+            _r = subprocess.run(["wget", "-q", _url, "-O", "/usr/local/bin/cloudflared"])
+            if _r.returncode != 0:
+                print("AVISO: download do cloudflared falhou - seguindo sem endereco fixo.")
+                return None
+            _os.chmod("/usr/local/bin/cloudflared", 0o755)
+            _bin = "/usr/local/bin/cloudflared"
+
+        # mata um tunel antigo, caso a celula esteja sendo rodada de novo
+        subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
+        _t.sleep(1)
+
+        _logpath = "/content/cloudflared.log" if _os.path.isdir("/content") else "cloudflared.log"
+        _log = open(_logpath, "wb")
+        _env = dict(_os.environ)
+        _env["TUNNEL_TOKEN"] = _tok   # via ambiente: nao aparece na lista de processos
+        subprocess.Popen([_bin, "tunnel", "--no-autoupdate", "run"],
+                         env=_env, stdout=_log, stderr=subprocess.STDOUT)
+
+        for _i in range(30):          # espera ate 60s pelo tunel conectar
+            _t.sleep(2)
             try:
-                _url = _fn().public_url
-                print("OK: endereco fixo (ngrok, forma '" + _nome + "') -> " + str(_url))
-                return _url
-            except Exception as _e1:
-                _erros.append(_nome + " -> " + str(_e1)[:300])
-                try:
-                    _ng.kill()
-                except Exception:
-                    pass
-        print("AVISO: ngrok nao subiu em nenhuma das 3 formas - seguindo com o link normal do Gradio.")
-        for _m in _erros:
-            print("   - " + _m)
+                _txt = open(_logpath, "r", errors="ignore").read()
+            except Exception:
+                _txt = ""
+            if "Registered tunnel connection" in _txt:
+                print("OK: endereco fixo (Cloudflare) -> https://" + CF_DOMINIO)
+                return "https://" + CF_DOMINIO
+            if "Unauthorized" in _txt or "invalid tunnel token" in _txt.lower():
+                print("AVISO: a Cloudflare recusou o token (CF_TUNNEL_TOKEN) - seguindo sem endereco fixo.")
+                return None
+        print("AVISO: o tunel da Cloudflare nao conectou em 60s - seguindo com o link normal do Gradio.")
+        print("   (o motivo esta em " + _logpath + ")")
         return None
     except Exception as _e:
-        print("AVISO: ngrok nao subiu (" + str(_e) + ") - seguindo com o link normal do Gradio.")
+        print("AVISO: tunel da Cloudflare nao subiu (" + str(_e) + ") - seguindo com o link normal do Gradio.")
         return None
 
 # ---- abre como SITE (tela cheia), nao espremido dentro do Colab ----
 carregar_modelo()
 _demo = app.queue(default_concurrency_limit=1)
-_res = _demo.launch(share=True, inline=False, prevent_thread_lock=True)
-_fixo = _abrir_ngrok(_demo)   # v5.9: endereco fixo (None se o ngrok falhar)
+try:
+    # porta fixa: e pra ela que o tunel da Cloudflare aponta
+    _res = _demo.launch(share=True, inline=False, prevent_thread_lock=True,
+                        server_port=PORTA_FIXA)
+    _porta_ok = True
+except Exception as _e_porta:
+    print("AVISO: a porta " + str(PORTA_FIXA) + " esta ocupada ("
+          + str(_e_porta)[:200] + ") - subindo numa porta livre, SEM endereco fixo.")
+    _res = _demo.launch(share=True, inline=False, prevent_thread_lock=True)
+    _porta_ok = False
+_fixo = _abrir_cloudflare() if _porta_ok else None   # v6.2: endereco fixo (None se falhar)
 _share = None
 try:
     _share = _res[2] if isinstance(_res, (list, tuple)) and len(_res) > 2 else getattr(_demo, "share_url", None)
@@ -757,7 +778,7 @@ if not _share:
             _port = getattr(_srv, "port", None) or getattr(_demo, "server_port", None)
         except Exception:
             _port = getattr(_demo, "server_port", None)
-        _port = _port or 7860
+        _port = _port or PORTA_FIXA
         _share = _colab_eval_js(f"google.colab.kernel.proxyPort({_port})")
     except Exception:
         _share = None
