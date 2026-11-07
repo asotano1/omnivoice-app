@@ -704,6 +704,11 @@ def _abrir_cloudflare():
         if not _tok:
             print("AVISO: CF_TUNNEL_TOKEN vazio nos Secrets do Colab - seguindo sem endereco fixo.")
             return None
+        # aceita tanto o token puro quanto o comando inteiro que a Cloudflare
+        # manda copiar ("cloudflared.exe service install eyJhIjoi...").
+        _tok = _tok.strip()
+        if "eyJ" in _tok:
+            _tok = _tok[_tok.index("eyJ"):].split()[0]
 
         _bin = _sh.which("cloudflared") or "/usr/local/bin/cloudflared"
         if not _os.path.exists(_bin):
